@@ -131,13 +131,13 @@ impl SurrealDbClient {
         tags: &[String],
     ) -> Result<Value> {
         let tags_surql: Vec<String> =
-            tags.iter().map(|t| format!("'{}'", escape_single_quotes(t))).collect();
+            tags.iter().map(|t| format!("'{}'", escape_surql(t))).collect();
         let sql = format!(
             "INSERT INTO knowledge (project, type, title, body, tags) VALUES ('{}', '{}', '{}', '{}', [{}]) RETURN *;",
-            escape_single_quotes(project),
-            escape_single_quotes(type_),
-            escape_single_quotes(title),
-            escape_single_quotes(body),
+            escape_surql(project),
+            escape_surql(type_),
+            escape_surql(title),
+            escape_surql(body),
             tags_surql.join(", "),
         );
         self.query(&sql).await
@@ -165,20 +165,20 @@ impl SurrealDbClient {
         // Text search — wrap in parens for correct operator precedence
         let text_or = format!(
             "(title CONTAINS '{}' OR body CONTAINS '{}')",
-            escape_single_quotes(query),
-            escape_single_quotes(query),
+            escape_surql(query),
+            escape_surql(query),
         );
         conditions.push(text_or);
 
         // Optional project filter
         if let Some(p) = project {
-            conditions.push(format!("project = '{}'", escape_single_quotes(p)));
+            conditions.push(format!("project = '{}'", escape_surql(p)));
         }
 
         // Optional tags filter (AND semantics)
         if let Some(t) = tags {
             for tag in t {
-                conditions.push(format!("tags CONTAINS '{}'", escape_single_quotes(tag)));
+                conditions.push(format!("tags CONTAINS '{}'", escape_surql(tag)));
             }
         }
 
@@ -192,9 +192,13 @@ impl SurrealDbClient {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Escape single-quotes for SurrealDB SURQL (double them, standard SQL style).
-fn escape_single_quotes(s: &str) -> String {
-    s.replace('\'', "''")
+/// Escape strings for SurrealDB v3 SURQL.
+///
+/// SurrealDB v3 uses backslash escaping (`\'`), not SQL-style doubling (`''`).
+/// Also escape backslash itself to prevent interpretation of escape sequences.
+fn escape_surql(s: &str) -> String {
+    // Order matters: escape backslash FIRST, then single quote
+    s.replace("\\", "\\\\").replace("\'", "\\'")
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +210,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_single_quotes_works() {
-        assert_eq!(escape_single_quotes("hello"), "hello");
-        assert_eq!(escape_single_quotes("it's"), "it''s");
-        assert_eq!(escape_single_quotes("'quoted'"), "''quoted''");
-        assert_eq!(escape_single_quotes(""), "");
+    fn escape_surql_works() {
+        assert_eq!(escape_surql("hello"), "hello");
+        assert_eq!(escape_surql("it's"), "it\\'s");
+        assert_eq!(escape_surql("'quoted'"), "\\'quoted\\'");
+        assert_eq!(escape_surql("path\\to\\file"), "path\\\\to\\\\file");
+        assert_eq!(escape_surql("\\'escaped\\'"), "\\\\\\'escaped\\\\\\'");
+        assert_eq!(escape_surql(""), "");
     }
 
     /// Helper: run a closure with a clean env snapshot (save/restore all SURREALDB_* vars).
