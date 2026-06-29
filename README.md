@@ -79,6 +79,29 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
+### Run with opencode
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcpServers": {
+    "surrealdb": {
+      "command": "/path/to/surrealdb-mcp",
+      "env": {
+        "SURREALDB_URL": "http://localhost:8000",
+        "SURREALDB_USER": "root",
+        "SURREALDB_PASS": "root",
+        "SURREALDB_NS": "main",
+        "SURREALDB_DB": "main"
+      }
+    }
+  }
+}
+```
+
+Restart opencode. Tools will appear in the AI assistant.
+
 ---
 
 ## Configuration
