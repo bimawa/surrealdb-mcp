@@ -1,15 +1,3 @@
-/// SurrealDB MCP server — binary crate.
-///
-/// Thin JSON-RPC 2.0 loop over stdin/stdout that wires MCP methods
-/// (`initialize`, `tools/list`, `tools/call`, …) to the `SurrealDbClient`
-/// in the library crate.
-///
-/// # Protocol
-///
-/// * Messages are newline-delimited JSON-RPC 2.0 objects on stdin/stdout.
-/// * Stderr is reserved for diagnostics / tracing — it is **not** part of
-///   the MCP transport.
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use surrealdb_mcp::{Config, SurrealDbClient};
@@ -75,6 +63,16 @@ fn make_success(id: Option<Value>, result: Value) -> JsonRpcResponse {
     }
 }
 
+/// Wrap a JSON value as an MCP text content block.
+fn mcp_text_content(data: Value) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&data).unwrap_or_default()
+        }]
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions (MCP "list" response)
 // ---------------------------------------------------------------------------
@@ -83,31 +81,184 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "surrealdb-query",
-            "description": "Execute a raw SQL / SURQL query against SurrealDB",
+            "description": "Execute a raw SQL / SURQL statement against SurrealDB",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sql": {
                         "type": "string",
-                        "description": "The SQL query to execute (e.g. SELECT * FROM knowledge;)"
+                        "description": "The SURQL query to execute"
                     }
                 },
                 "required": ["sql"]
             }
         },
         {
-            "name": "surrealdb-insert",
-            "description": "Insert a knowledge record into the 'knowledge' table",
+            "name": "surrealdb-select",
+            "description": "Select records from a table",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string", "description": "Project / namespace identifier" },
-                    "type":    { "type": "string", "description": "Record type (e.g. 'doc', 'note', 'reference')" },
-                    "title":   { "type": "string", "description": "Record title" },
-                    "body":    { "type": "string", "description": "Record body / content" },
-                    "tags":    { "type": "array", "items": { "type": "string" }, "description": "Tags for the record" }
+                    "table": { "type": "string", "description": "Table name" },
+                    "filter": { "type": "string", "description": "Optional WHERE clause (e.g. 'age > 21')" },
+                    "order": { "type": "string", "description": "Optional ORDER BY clause (e.g. 'created_at DESC')" },
+                    "limit": { "type": "number", "description": "Optional LIMIT count" },
+                    "offset": { "type": "number", "description": "Optional START / OFFSET count" }
                 },
-                "required": ["project", "type", "title", "body", "tags"]
+                "required": ["table"]
+            }
+        },
+        {
+            "name": "surrealdb-create",
+            "description": "Create a new record in a table (auto-generates record ID)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": { "type": "string", "description": "Table name" },
+                    "data": {
+                        "type": "object",
+                        "description": "Optional record data as JSON object (uses CONTENT syntax)"
+                    }
+                },
+                "required": ["table"]
+            }
+        },
+        {
+            "name": "surrealdb-insert",
+            "description":
+                "General-purpose INSERT: provide a table name and data (object or array of objects).\n\
+                 For knowledge-base insertion use the 'project', 'type', 'title', 'body', 'tags' params instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": { "type": "string", "description": "Table name (required for general insert)" },
+                    "data": {
+                        "description": "Record data as a JSON object or array of objects (required for general insert)"
+                    },
+                    "project": { "type": "string", "description": "Knowledge-base: project name" },
+                    "type": { "type": "string", "description": "Knowledge-base: record type" },
+                    "title": { "type": "string", "description": "Knowledge-base: record title" },
+                    "body": { "type": "string", "description": "Knowledge-base: record body" },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Knowledge-base: tags"
+                    }
+                },
+                "oneOf": [
+                    { "required": ["table", "data"] },
+                    { "required": ["project", "type", "title", "body"] }
+                ]
+            }
+        },
+        {
+            "name": "surrealdb-upsert",
+            "description": "Upsert a record — create or replace based on unique identifier",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": { "type": "string", "description": "Table name" },
+                    "data": { "type": "object", "description": "Record data as JSON object (uses CONTENT syntax)" }
+                },
+                "required": ["table", "data"]
+            }
+        },
+        {
+            "name": "surrealdb-update",
+            "description": "Update records in a table",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": { "type": "string", "description": "Table name" },
+                    "data": { "type": "object", "description": "Fields to merge (uses MERGE syntax)" },
+                    "filter": { "type": "string", "description": "Optional WHERE clause" }
+                },
+                "required": ["table", "data"]
+            }
+        },
+        {
+            "name": "surrealdb-delete",
+            "description": "Delete records from a table",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": { "type": "string", "description": "Table name" },
+                    "filter": { "type": "string", "description": "Optional WHERE clause" }
+                },
+                "required": ["table"]
+            }
+        },
+        {
+            "name": "surrealdb-relate",
+            "description": "Create a graph edge between two records",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source record ID (e.g. 'user:123')" },
+                    "edge": { "type": "string", "description": "Edge type (e.g. 'purchased')" },
+                    "to": { "type": "string", "description": "Target record ID (e.g. 'product:456')" },
+                    "data": { "type": "object", "description": "Optional edge properties as JSON object" }
+                },
+                "required": ["from", "edge", "to"]
+            }
+        },
+        {
+            "name": "surrealdb-run",
+            "description": "Call a SurrealDB database function",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "func": { "type": "string", "description": "Function name (e.g. 'math::sin', 'array::sort')" },
+                    "args": {
+                        "type": "array",
+                        "items": {},
+                        "description": "Optional arguments array"
+                    }
+                },
+                "required": ["func"]
+            }
+        },
+        {
+            "name": "surrealdb-list",
+            "description": "List schema objects — namespaces, databases, tables, indexes, users, etc.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "What to list: 'KV', 'NS', 'DB', 'TABLE', 'TABLE <name>', 'SCOPE', 'INDEX', 'USER', 'TOKEN', 'PARAM', 'EVENT', 'FIELD', 'FUNCTION', 'ANALYZER'"
+                    }
+                },
+                "required": ["scope"]
+            }
+        },
+        {
+            "name": "surrealdb-use",
+            "description": "Switch the active namespace and/or database context",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ns": { "type": "string", "description": "Optional: namespace to switch to" },
+                    "db": { "type": "string", "description": "Optional: database to switch to" }
+                },
+                "anyOf": [
+                    { "required": ["ns"] },
+                    { "required": ["db"] }
+                ]
+            }
+        },
+        {
+            "name": "surrealdb-info",
+            "description": "Get schema or engine information for a scope",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Scope: 'DB', 'TABLE <name>', 'KV', 'NS', 'SCOPE <name>', 'engine' (or 'version')"
+                    }
+                },
+                "required": ["scope"]
             }
         },
         {
@@ -116,9 +267,13 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query":   { "type": "string", "description": "Search text (matched against title and body via CONTAINS)" },
+                    "query": { "type": "string", "description": "Search text" },
                     "project": { "type": "string", "description": "Optional: filter by project" },
-                    "tags":    { "type": "array", "items": { "type": "string" }, "description": "Optional: filter by tags (AND semantics)" }
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional: filter by tags (AND semantics)"
+                    }
                 },
                 "required": ["query"]
             }
@@ -144,14 +299,12 @@ async fn handle_request(req: JsonRpcRequest, client: &SurrealDbClient) -> JsonRp
                 },
                 "serverInfo": {
                     "name": "surrealdb-mcp",
-                    "version": "0.1.0"
+                    "version": "0.2.0"
                 }
             }),
         ),
 
         "notifications/initialized" | "notifications/cancelled" | "notifications/roots/list_changed" => {
-            // Notifications carry no id → caller already skips writing.
-            // Return a no-op response (will not be transmitted).
             JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 id: None,
@@ -167,90 +320,243 @@ async fn handle_request(req: JsonRpcRequest, client: &SurrealDbClient) -> JsonRp
 
         // ── Tool execution ─────────────────────────────────────────
         "tools/call" => {
-            let name = req
+            let tool_name = req
                 .params
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let arguments = req
+            let args = req
                 .params
                 .get("arguments")
                 .cloned()
                 .unwrap_or(json!({}));
 
-            let tool_result = match name {
+            let tool_result = match tool_name {
+                // ── Raw query ───────────────────────────────────────
                 "surrealdb-query" => {
-                    let sql = arguments
-                        .get("sql")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let sql = args.get("sql").and_then(|v| v.as_str()).unwrap_or("");
                     if sql.is_empty() {
-                        return make_error(
-                            id,
-                            -32602,
-                            "Missing required parameter: sql".into(),
-                        );
+                        return make_error(id, -32602, "Missing required parameter: sql".into());
                     }
                     match client.query(sql).await {
                         Ok(data) => mcp_text_content(data),
-                        Err(e) => {
-                            return make_error(id, -32603, format!("Query failed: {e}"));
-                        }
+                        Err(e) => return make_error(id, -32603, format!("Query failed: {e}")),
                     }
                 }
 
-                "surrealdb-insert" => {
-                    let project = arguments.get("project").and_then(|v| v.as_str()).unwrap_or("");
-                    let type_ = arguments.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    let title = arguments.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = arguments.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    let tags: Vec<String> = arguments
-                        .get("tags")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                        .unwrap_or_default();
+                // ── Select ──────────────────────────────────────────
+                "surrealdb-select" => {
+                    let table = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    if table.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: table".into());
+                    }
+                    let filter = args.get("filter").and_then(|v| v.as_str());
+                    let order = args.get("order").and_then(|v| v.as_str());
+                    let limit = args.get("limit").and_then(|v| v.as_i64());
+                    let offset = args.get("offset").and_then(|v| v.as_i64());
+                    match client.select_records(table, filter, order, limit, offset).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Select failed: {e}")),
+                    }
+                }
 
-                    if project.is_empty() || type_.is_empty() || title.is_empty() || body.is_empty() {
+                // ── Create ──────────────────────────────────────────
+                "surrealdb-create" => {
+                    let table = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    if table.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: table".into());
+                    }
+                    let data = args.get("data").cloned();
+                    match client.create_record(table, data).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Create failed: {e}")),
+                    }
+                }
+
+                // ── Insert (dual-route: general OR knowledge) ──────
+                "surrealdb-insert" => {
+                    let has_table = args.get("table").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());
+                    let has_project = args.get("project").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());
+
+                    if has_project {
+                        // Knowledge path
+                        let project = args.get("project").and_then(|v| v.as_str()).unwrap_or("");
+                        let type_ = args.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                        let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                        let tags: Vec<String> = args
+                            .get("tags")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+
+                        if project.is_empty() || type_.is_empty() || title.is_empty() || body.is_empty() {
+                            return make_error(
+                                id,
+                                -32602,
+                                "Missing required knowledge params. Required: project, type, title, body".into(),
+                            );
+                        }
+                        match client.insert_knowledge(project, type_, title, body, &tags).await {
+                            Ok(data) => mcp_text_content(data),
+                            Err(e) => return make_error(id, -32603, format!("Insert knowledge failed: {e}")),
+                        }
+                    } else if has_table {
+                        // General data path
+                        let table = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                        let data = match args.get("data") {
+                            Some(d) if !d.is_null() => d.clone(),
+                            _ => {
+                                return make_error(id, -32602, "Missing required parameter: data".into());
+                            }
+                        };
+                        match client.insert_data(table, data).await {
+                            Ok(data) => mcp_text_content(data),
+                            Err(e) => return make_error(id, -32603, format!("Insert failed: {e}")),
+                        }
+                    } else {
                         return make_error(
                             id,
                             -32602,
-                            "Missing required parameters. Required: project, type, title, body, tags".into(),
+                            "Provide either 'table'+'data' for general insert, or 'project'+'type'+'title'+'body' for knowledge insert".into(),
                         );
-                    }
-                    match client.insert_knowledge(project, type_, title, body, &tags).await {
-                        Ok(data) => mcp_text_content(data),
-                        Err(e) => {
-                            return make_error(id, -32603, format!("Insert failed: {e}"));
-                        }
                     }
                 }
 
+                // ── Upsert ──────────────────────────────────────────
+                "surrealdb-upsert" => {
+                    let table = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    if table.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: table".into());
+                    }
+                    let data = match args.get("data") {
+                        Some(d) if !d.is_null() => d.clone(),
+                        _ => return make_error(id, -32602, "Missing required parameter: data".into()),
+                    };
+                    match client.upsert_data(table, data).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Upsert failed: {e}")),
+                    }
+                }
+
+                // ── Update ──────────────────────────────────────────
+                "surrealdb-update" => {
+                    let table = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    if table.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: table".into());
+                    }
+                    let data = match args.get("data") {
+                        Some(d) if !d.is_null() => d.clone(),
+                        _ => return make_error(id, -32602, "Missing required parameter: data".into()),
+                    };
+                    let filter = args.get("filter").and_then(|v| v.as_str());
+                    match client.update_records(table, data, filter).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Update failed: {e}")),
+                    }
+                }
+
+                // ── Delete ──────────────────────────────────────────
+                "surrealdb-delete" => {
+                    let table = args.get("table").and_then(|v| v.as_str()).unwrap_or("");
+                    if table.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: table".into());
+                    }
+                    let filter = args.get("filter").and_then(|v| v.as_str());
+                    match client.delete_records(table, filter).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Delete failed: {e}")),
+                    }
+                }
+
+                // ── Relate ──────────────────────────────────────────
+                "surrealdb-relate" => {
+                    let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                    let edge = args.get("edge").and_then(|v| v.as_str()).unwrap_or("");
+                    let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                    if from.is_empty() || edge.is_empty() || to.is_empty() {
+                        return make_error(
+                            id,
+                            -32602,
+                            "Missing required parameters. Required: from, edge, to".into(),
+                        );
+                    }
+                    let data = args.get("data").cloned();
+                    match client.relate_records(from, edge, to, data).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Relate failed: {e}")),
+                    }
+                }
+
+                // ── Run (function call) ─────────────────────────────
+                "surrealdb-run" => {
+                    let func = args.get("func").and_then(|v| v.as_str()).unwrap_or("");
+                    if func.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: func".into());
+                    }
+                    let fn_args = args.get("args").and_then(|v| v.as_array()).cloned();
+                    match client.call_function(func, fn_args).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Run failed: {e}")),
+                    }
+                }
+
+                // ── List schema ─────────────────────────────────────
+                "surrealdb-list" => {
+                    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                    if scope.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: scope".into());
+                    }
+                    match client.list_schema(scope).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("List failed: {e}")),
+                    }
+                }
+
+                // ── Use context ─────────────────────────────────────
+                "surrealdb-use" => {
+                    let ns = args.get("ns").and_then(|v| v.as_str());
+                    let db = args.get("db").and_then(|v| v.as_str());
+                    if ns.is_none() && db.is_none() {
+                        return make_error(
+                            id,
+                            -32602,
+                            "At least one of 'ns' or 'db' must be provided".into(),
+                        );
+                    }
+                    match client.use_context(ns, db).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Use failed: {e}")),
+                    }
+                }
+
+                // ── Info ────────────────────────────────────────────
+                "surrealdb-info" => {
+                    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                    if scope.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: scope".into());
+                    }
+                    match client.info_schema(scope).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Info failed: {e}")),
+                    }
+                }
+
+                // ── Search (knowledge) ──────────────────────────────
                 "surrealdb-search" => {
-                    let query = arguments
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let project = arguments.get("project").and_then(|v| v.as_str());
-                    let tags: Option<Vec<String>> = arguments
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let project = args.get("project").and_then(|v| v.as_str());
+                    let tags: Option<Vec<String>> = args
                         .get("tags")
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
 
                     if query.is_empty() {
-                        return make_error(
-                            id,
-                            -32602,
-                            "Missing required parameter: query".into(),
-                        );
+                        return make_error(id, -32602, "Missing required parameter: query".into());
                     }
-                    match client
-                        .search_knowledge(query, project, tags.as_deref())
-                        .await
-                    {
+                    match client.search_knowledge(query, project, tags.as_deref()).await {
                         Ok(data) => mcp_text_content(data),
-                        Err(e) => {
-                            return make_error(id, -32603, format!("Search failed: {e}"));
-                        }
+                        Err(e) => return make_error(id, -32603, format!("Search failed: {e}")),
                     }
                 }
 
@@ -267,23 +573,12 @@ async fn handle_request(req: JsonRpcRequest, client: &SurrealDbClient) -> JsonRp
     }
 }
 
-/// Wrap a JSON value as an MCP text content block.
-fn mcp_text_content(data: Value) -> Value {
-    json!({
-        "content": [{
-            "type": "text",
-            "text": serde_json::to_string_pretty(&data).unwrap_or_default()
-        }]
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
-    // Send all diagnostics to stderr so stdout stays clean for MCP.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -295,7 +590,8 @@ async fn main() {
     let config = Config::from_env();
 
     tracing::info!(
-        "surrealdb-mcp starting — SurrealDB URL: {}",
+        "surrealdb-mcp v{} starting — SurrealDB URL: {}",
+        "0.2.0",
         config.url
     );
 
@@ -314,7 +610,6 @@ async fn main() {
         let req: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                // Parse error — we have no id, use null per JSON-RPC spec
                 let err_resp = make_error(Some(Value::Null), -32700, format!("Parse error: {e}"));
                 let _ = write_json_to_stdout(&err_resp).await;
                 continue;
@@ -324,7 +619,6 @@ async fn main() {
         let is_notification = req.id.is_none();
         let resp = handle_request(req, &client).await;
 
-        // Notifications have no `id` → client expects no response
         if !is_notification && resp.id.is_some() {
             if let Err(e) = write_json_to_stdout(&resp).await {
                 tracing::error!("Failed to write response to stdout: {e}");
@@ -336,7 +630,6 @@ async fn main() {
     tracing::info!("stdin closed — surrealdb-mcp shutting down");
 }
 
-/// Serialise a JSON-RPC response and write it (newline-terminated) to stdout.
 async fn write_json_to_stdout(resp: &JsonRpcResponse) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string(resp)?;
     let mut stdout = tokio::io::stdout();
