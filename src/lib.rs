@@ -14,6 +14,9 @@ pub struct Config {
     pub token: String,  // JWT / Bearer token for SurrealDB Cloud or token-based auth
     pub ns: String,
     pub db: String,
+    pub lmstudio_url: String,
+    pub embedding_model: String,
+    pub use_embedding: bool,
 }
 
 impl Config {
@@ -31,6 +34,14 @@ impl Config {
                 .unwrap_or_else(|_| "main".into()),
             db: std::env::var("SURREALDB_DB")
                 .unwrap_or_else(|_| "main".into()),
+            lmstudio_url: std::env::var("LMSTUDIO_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into()),
+            embedding_model: std::env::var("EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "text-embedding-nomic-embed-text-v1.5".into()),
+            use_embedding: std::env::var("USE_EMBEDDING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
         }
     }
 }
@@ -91,27 +102,19 @@ impl SurrealDbClient {
         Self::check_response(resp).await
     }
 
-    /// Send a parameterised query (application/json) and parse the response.
-    async fn exec_params(&self, sql: &str, params: Value) -> Result<Value> {
-        let body = json!({
-            "query": sql,
-            "params": params
-        });
-        let req = self
-            .client
-            .post(format!("{}/sql", self.config.url));
-
-        let req = self.apply_auth(req);
-
-        let resp = req
-            .header("surreal-ns", &self.config.ns)
-            .header("surreal-db", &self.config.db)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to connect to SurrealDB")?;
-        Self::check_response(resp).await
+    /// Replace $data / $args placeholders with inline JSON SurrealQL, then exec_raw.
+    /// SurrealDB v3 HTTP API echoes param-bound JSON queries without executing —
+    /// so we inline the values directly.
+    async fn exec_inline(&self, sql: &str, data_value: &Value) -> Result<Value> {
+        let inline = serde_json::to_string(data_value)?;
+        let sql = if sql.contains("$data") {
+            sql.replace("$data", &inline)
+        } else if sql.contains("$args") {
+            sql.replace("$args", &inline)
+        } else {
+            sql.to_string()
+        };
+        self.exec_raw(&sql).await
     }
 
     /// Parse an HTTP response from SurrealDB, checking status and ERR payloads.
@@ -206,7 +209,7 @@ impl SurrealDbClient {
         match data {
             Some(d) => {
                 let sql = format!("CREATE {} CONTENT $data", table);
-                self.exec_params(&sql, json!({"data": d})).await
+                self.exec_inline(&sql, &d).await
             }
             None => {
                 let sql = format!("CREATE {}", table);
@@ -217,12 +220,12 @@ impl SurrealDbClient {
 
     pub async fn insert_data(&self, table: &str, data: Value) -> Result<Value> {
         let sql = format!("INSERT INTO {} $data", escape_surql(table));
-        self.exec_params(&sql, json!({"data": data})).await
+        self.exec_inline(&sql, &data).await
     }
 
     pub async fn upsert_data(&self, table: &str, data: Value) -> Result<Value> {
         let sql = format!("UPSERT {} CONTENT $data", escape_surql(table));
-        self.exec_params(&sql, json!({"data": data})).await
+        self.exec_inline(&sql, &data).await
     }
 
     pub async fn update_records(
@@ -235,7 +238,7 @@ impl SurrealDbClient {
         if let Some(f) = filter {
             sql.push_str(&format!(" WHERE {}", f));
         }
-        self.exec_params(&sql, json!({"data": data})).await
+        self.exec_inline(&sql, &data).await
     }
 
     pub async fn delete_records(&self, table: &str, filter: Option<&str>) -> Result<Value> {
@@ -262,16 +265,27 @@ impl SurrealDbClient {
         match data {
             Some(d) => {
                 let full = format!("{} CONTENT $data", sql);
-                self.exec_params(&full, json!({"data": d})).await
+                self.exec_inline(&full, &d).await
             }
             None => self.exec_raw(&sql).await,
         }
     }
 
     pub async fn call_function(&self, func: &str, args: Option<Vec<Value>>) -> Result<Value> {
-        let sql = format!("SELECT fn::{}($args) AS result", escape_surql(func));
-        let params = json!({"args": args.unwrap_or_default()});
-        self.exec_params(&sql, params).await
+        // SurrealDB v3: functions use `RETURN func(args)` — SELECT needs FROM.
+        // Args are spread: `math::sin(1.57)` not `math::sin([1.57])`.
+        let sql = match args {
+            Some(a) if !a.is_empty() => {
+                let parts: Vec<String> = a.iter()
+                    .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".into()))
+                    .collect();
+                format!("RETURN {}({})", escape_surql(func), parts.join(", "))
+            }
+            _ => {
+                format!("RETURN {}()", escape_surql(func))
+            }
+        };
+        self.exec_raw(&sql).await
     }
 
     pub async fn list_schema(&self, scope: &str) -> Result<Value> {
@@ -300,7 +314,8 @@ impl SurrealDbClient {
     pub async fn info_schema(&self, scope: &str) -> Result<Value> {
         let lower = scope.to_lowercase();
         let sql = match lower.as_str() {
-            "engine" | "version" => "SELECT version() AS version".to_string(),
+            // SurrealDB v3 doesn't expose version() — return system info instead
+            "engine" | "version" => "INFO FOR KV".to_string(),
             _ => build_info_sql(scope),
         };
         self.exec_raw(&sql).await
@@ -360,6 +375,123 @@ impl SurrealDbClient {
         let sql = format!("SELECT * FROM knowledge WHERE {};", where_clause);
         self.exec_raw(&sql).await
     }
+
+    // ------------------------------------------------------------------
+    // Embedding / vector methods
+    // ------------------------------------------------------------------
+
+    /// Embed text via LM Studio (OpenAI-compatible API).
+    /// Returns a 768-dimensional vector for nomic-embed-text-v1.5.
+    pub async fn lmstudio_embed(&self, text: &str) -> Result<Vec<f64>> {
+        if !self.config.use_embedding {
+            anyhow::bail!("Embedding is disabled");
+        }
+
+        let url = format!("{}/embeddings", self.config.lmstudio_url);
+        let body = json!({
+            "model": self.config.embedding_model,
+            "input": text,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to connect to LM Studio")?;
+
+        let http_status = resp.status();
+        let body_text = resp
+            .text()
+            .await
+            .context("Failed to read LM Studio response body")?;
+
+        let json_body: Value = serde_json::from_str(&body_text)
+            .context("Failed to parse LM Studio response as JSON")?;
+
+        if !http_status.is_success() {
+            anyhow::bail!(
+                "LM Studio HTTP {}: {}",
+                http_status,
+                serde_json::to_string(&json_body).unwrap_or_default()
+            );
+        }
+
+        let embedding = json_body["data"][0]["embedding"]
+            .as_array()
+            .context("LM Studio response missing data[0].embedding")?
+            .iter()
+            .map(|v| v.as_f64().context("Embedding value is not a valid f64"))
+            .collect::<Result<Vec<f64>>>()?;
+
+        Ok(embedding)
+    }
+
+    /// Store a record in the knowledge table with an auto-generated embedding vector.
+    /// The body text is embedded via LM Studio before insertion.
+    pub async fn store_with_vector(
+        &self,
+        project: &str,
+        type_: &str,
+        title: &str,
+        body: &str,
+        tags: &[String],
+    ) -> Result<Value> {
+        let vector = self.lmstudio_embed(body).await?;
+        let vector_str: String = vector
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tags_surql: Vec<String> =
+            tags.iter().map(|t| format!("'{}'", escape_surql(t))).collect();
+        let sql = format!(
+            "INSERT INTO knowledge (project, type, title, body, tags, vector) VALUES ('{}', '{}', '{}', '{}', [{}], [{}]) RETURN *",
+            escape_surql(project),
+            escape_surql(type_),
+            escape_surql(title),
+            escape_surql(body),
+            tags_surql.join(", "),
+            vector_str,
+        );
+        self.exec_raw(&sql).await
+    }
+
+    /// Semantic search via DISKANN vector index.
+    /// Embeds the query and performs vector similarity search.
+    pub async fn find_similar(
+        &self,
+        query: &str,
+        k: usize,
+        ef: usize,
+        project: Option<&str>,
+        min_score: Option<f64>,
+    ) -> Result<Value> {
+        let query_vec = self.lmstudio_embed(query).await?;
+        let query_vec_str: String = query_vec
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut sql = format!(
+            "SELECT *, vector::similarity::cosine(vector, [{}]) AS dist FROM knowledge WHERE vector <|{},{}|> [{}]",
+            query_vec_str, k, ef, query_vec_str,
+        );
+
+        if let Some(p) = project {
+            sql.push_str(&format!(" AND project = '{}'", escape_surql(p)));
+        }
+
+        if let Some(ms) = min_score {
+            sql.push_str(&format!(" AND dist >= {}", ms));
+        }
+
+        sql.push_str(&format!(" ORDER BY dist LIMIT {}", k));
+
+        self.exec_raw(&sql).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,25 +520,20 @@ fn build_info_sql(scope: &str) -> String {
     let kind = parts[0].to_uppercase();
     match kind.as_str() {
         "KV" | "NS" | "DB" => format!("INFO FOR {}", kind),
-        "TABLE" | "SCOPE" | "INDEX" | "USER" | "TOKEN" | "PARAM" | "EVENT" | "FIELD"
-        | "FUNCTION" | "ANALYZER" | "DATABASE" => {
+        "TABLE" | "SCOPE" | "INDEX" | "USER" | "TOKEN" | "EVENT" | "FIELD" => {
             if parts.len() > 1 {
-                let what = kind.as_str();
-                if what == "DATABASE" {
-                    // SurrealQL uses INFO FOR DB, not INFO FOR DATABASE
-                    format!("INFO FOR DB")
-                } else {
-                    format!("INFO FOR {} {}", what, escape_surql(parts[1]))
-                }
+                // INFO FOR TABLE <name> — valid in v3
+                format!("INFO FOR {} {}", kind.as_str(), escape_surql(parts[1]))
             } else {
-                let what = kind.as_str();
-                if what == "DATABASE" {
-                    "INFO FOR DB".into()
-                } else {
-                    format!("INFO FOR {}", what)
-                }
+                // Without a name these require a name in v3.
+                // Fall back to DB-level info which includes tables/users/events etc.
+                "INFO FOR DB".into()
             }
         }
+        "DATABASE" => "INFO FOR DB".into(),
+        // FUNCTION, PARAM, ANALYZER are not valid INFO targets in SurrealDB v3.
+        // Fall back to DB-level info.
+        "FUNCTION" | "PARAM" | "ANALYZER" => "INFO FOR DB".into(),
         // Bare table/scope name without keyword prefix
         _ => {
             // Try interpreting as a table name
@@ -455,7 +582,8 @@ mod tests {
 
     #[test]
     fn build_info_sql_table_no_name() {
-        assert_eq!(build_info_sql("TABLE"), "INFO FOR TABLE");
+        // SurrealDB v3 requires a name after TABLE; fall back to DB-level info.
+        assert_eq!(build_info_sql("TABLE"), "INFO FOR DB");
     }
 
     #[test]
@@ -487,6 +615,9 @@ mod tests {
             "SURREALDB_TOKEN",
             "SURREALDB_NS",
             "SURREALDB_DB",
+            "LMSTUDIO_URL",
+            "EMBEDDING_MODEL",
+            "USE_EMBEDDING",
         ];
         let saved: Vec<(String, Option<String>)> = keys
             .iter()
@@ -537,6 +668,30 @@ mod tests {
             assert_eq!(cfg.token, "tok_xxx");
             assert_eq!(cfg.ns, "ns1");
             assert_eq!(cfg.db, "db1");
+        });
+    }
+
+    #[test]
+    fn config_from_env_embedding_defaults() {
+        with_clean_env(|| {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.lmstudio_url, "http://127.0.0.1:1234/v1");
+            assert_eq!(cfg.embedding_model, "text-embedding-nomic-embed-text-v1.5");
+            assert_eq!(cfg.use_embedding, true);
+        });
+    }
+
+    #[test]
+    fn config_from_env_embedding_custom() {
+        with_clean_env(|| {
+            std::env::set_var("LMSTUDIO_URL", "http://custom:8080/v1");
+            std::env::set_var("EMBEDDING_MODEL", "custom-model");
+            std::env::set_var("USE_EMBEDDING", "false");
+
+            let cfg = Config::from_env();
+            assert_eq!(cfg.lmstudio_url, "http://custom:8080/v1");
+            assert_eq!(cfg.embedding_model, "custom-model");
+            assert_eq!(cfg.use_embedding, false);
         });
     }
 }

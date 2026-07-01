@@ -277,6 +277,47 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["query"]
             }
+        },
+        {
+            "name": "surrealdb-embed",
+            "description": "Convert text to an embedding vector via LM Studio (nomic-embed-text-v1.5, 768-dim)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Text to embed" }
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "surrealdb-store",
+            "description": "Store text with auto-generated embedding vector into the knowledge base. Automatically embeds the 'body' text via LM Studio before inserting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name" },
+                    "type": { "type": "string", "description": "Record type (e.g. 'doc', 'note')" },
+                    "title": { "type": "string", "description": "Record title" },
+                    "body": { "type": "string", "description": "Record body content (will be embedded)" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags" }
+                },
+                "required": ["project", "type", "title", "body"]
+            }
+        },
+        {
+            "name": "surrealdb-find",
+            "description": "Semantic search via DISKANN vector index. Embeds the query text and performs vector similarity search on the knowledge base.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural language search query" },
+                    "k": { "type": "number", "description": "Number of results to return (default: 10)" },
+                    "ef": { "type": "number", "description": "DISKANN EF parameter — search breadth (default: 100)" },
+                    "project": { "type": "string", "description": "Optional: filter by project name" },
+                    "min_score": { "type": "number", "description": "Optional: minimum similarity score (0.0 to 1.0)" }
+                },
+                "required": ["query"]
+            }
         }
     ])
 }
@@ -557,6 +598,60 @@ async fn handle_request(req: JsonRpcRequest, client: &SurrealDbClient) -> JsonRp
                     match client.search_knowledge(query, project, tags.as_deref()).await {
                         Ok(data) => mcp_text_content(data),
                         Err(e) => return make_error(id, -32603, format!("Search failed: {e}")),
+                    }
+                }
+
+                // ── Embed ────────────────────────────────────────────
+                "surrealdb-embed" => {
+                    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if text.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: text".into());
+                    }
+                    match client.lmstudio_embed(text).await {
+                        Ok(embedding) => mcp_text_content(json!({"embedding": embedding})),
+                        Err(e) => return make_error(id, -32603, format!("Embed failed: {e}")),
+                    }
+                }
+
+                // ── Store with vector ────────────────────────────────
+                "surrealdb-store" => {
+                    let project = args.get("project").and_then(|v| v.as_str()).unwrap_or("");
+                    let type_ = args.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    let tags: Vec<String> = args
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+
+                    if project.is_empty() || type_.is_empty() || title.is_empty() || body.is_empty() {
+                        return make_error(
+                            id,
+                            -32602,
+                            "Missing required parameters. Required: project, type, title, body".into(),
+                        );
+                    }
+                    match client.store_with_vector(project, type_, title, body, &tags).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Store failed: {e}")),
+                    }
+                }
+
+                // ── Find similar (vector search) ─────────────────────
+                "surrealdb-find" => {
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                    let ef = args.get("ef").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                    let project = args.get("project").and_then(|v| v.as_str());
+                    let min_score = args.get("min_score").and_then(|v| v.as_f64());
+
+                    if query.is_empty() {
+                        return make_error(id, -32602, "Missing required parameter: query".into());
+                    }
+                    match client.find_similar(query, k, ef, project, min_score).await {
+                        Ok(data) => mcp_text_content(data),
+                        Err(e) => return make_error(id, -32603, format!("Find failed: {e}")),
                     }
                 }
 
